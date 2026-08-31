@@ -1,0 +1,11 @@
+1. Platform/gateway commission gap. Ledger says the full sale amount; bank shows a smaller net amount because a payment processor or marketplace took a cut before settling. (This is the Zomato-shaped case, generalized — no platform name required, just "the settled amount is a plausible percentage of the invoiced amount.")
+
+2. Flat transaction fee. A small, fixed amount is deducted — not a percentage, a flat number, same every time regardless of transaction size. Different mechanism than case 1, and your agent needs to tell them apart (percentage-of-amount vs. flat-number reasoning are genuinely different checks).
+
+3. GST-inclusive vs. GST-exclusive mismatch. Ledger records a pre-tax amount; the real settled amount includes tax. You've already worked this one out in detail — it's a clean, explainable, non-alarming mismatch, and it's specifically an India/GST-relevant case, which matters given who's running this buildathon.
+
+4. Settlement delay (T+1, T+2). Money doesn't land the same day it's invoiced — batched settlement is completely normal in payments, and your agent needs a date window, not an exact-date requirement, or it'll falsely flag every single normal transaction as unmatched.
+
+5. Partial refund. Full amount was invoiced, but the customer got some money back, so the net settled amount is smaller — for a completely different reason than commission (this one should show a specific, not-a-percentage, not-a-round-number reduction, since refunds are usually item-specific, not proportional).
+
+6. Split settlement across multiple payouts. One invoice, but the platform pays it out in two or more smaller transactions on di
