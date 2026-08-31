@@ -1,5 +1,3 @@
-
-Invoice ID,Invoice Date,Due Date,Customer Name,Invoice Amount,GST Amount,Total Amount,Status
 Invoice ID,Invoice Date,Due Date,Customer Name,Invoice Amount,GST Amount,Total Amount,Status
 INV2201,2026-08-01,2026-08-01,Acme Corp Pvt Ltd,47607.62,2380.38,49988.00,Paid
 INV2202,2026-08-03,2026-08-03,Beta Ltd,11428.57,571.43,12000.00,Paid
