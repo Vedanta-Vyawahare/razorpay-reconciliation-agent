@@ -1,1 +1,10 @@
-
+invoice_id,bank_ref,ledger_amount,bank_amount,gap,gap_pct,amount_category,amount_score,date_gap,settlement_category,date_score,transaction_type,type_score,evidence_score,ambiguity_penalty,final_score,competing_refs,decision,reason,requires_human_review
+INV3001,500100001,49988.0,49988.0,0.0,0.0,EXACT,100,0,SAME_DAY,100,UPI,100,97.0,0.0,97.0,[],MATCHED,Bank transaction matches the ledger amount exactly.,False
+INV3002,500100002,12000.0,12000.0,0.0,0.0,EXACT,100,0,SAME_DAY,100,UPI,100,97.0,0.0,97.0,[],MATCHED,Bank transaction matches the ledger amount exactly.,False
+INV3004,500100004,10000.0,10000.0,0.0,0.0,EXACT,100,0,SAME_DAY,100,NEFT,100,97.0,0.0,97.0,[],MATCHED,Bank transaction matches the ledger amount exactly.,False
+INV3006,500100006,20000.0,20000.0,0.0,0.0,EXACT,100,0,SAME_DAY,100,UPI,100,97.0,0.0,97.0,[],MATCHED,Bank transaction matches the ledger amount exactly.,False
+INV3009,500100010,15000.0,15000.0,0.0,0.0,EXACT,100,0,SAME_DAY,100,NEFT,100,97.0,0.0,97.0,[],MATCHED,Bank transaction matches the ledger amount exactly.,False
+INV3010,500100011,1000.0,1000.0,0.0,0.0,EXACT,100,0,SAME_DAY,100,UPI,100,97.0,0.0,97.0,[],MATCHED,Bank transaction matches the ledger amount exactly.,False
+INV3011,500100012,25000.0,25000.0,0.0,0.0,EXACT,100,0,SAME_DAY,100,UPI,100,97.0,0.0,97.0,[],MATCHED,Bank transaction matches the ledger amount exactly.,False
+INV3013,500100013,18000.0,18000.0,0.0,0.0,EXACT,100,0,SAME_DAY,100,UPI,100,97.0,0.0,97.0,[],MATCHED,Bank transaction matches the ledger amount exactly.,False
+INV3014,500100014,9000.0,9000.0,0.0,0.0,EXACT,100,0,SAME_DAY,100,UPI,100,97.0,0.0,97.0,[],MATCHED,Bank transaction matches the ledger amount exactly.,False
