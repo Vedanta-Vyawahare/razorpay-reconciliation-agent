@@ -112,18 +112,16 @@ def amount_score(
     bank_amount
 ):
     """
-    Amount evidence.
+    Calculate amount evidence.
 
     Maximum:
         WEIGHTS["amount"]
 
-    The score decreases continuously as the percentage
-    difference increases.
+    The Razorpay `net_settlement` is compared directly
+    against the bank credit amount.
 
-    Exact settlement amount receives the full amount weight.
-
-    This is deliberately much more sensitive than the old
-    EXACT / SMALL / MODERATE / LARGE buckets.
+    Exact equality receives the full amount weight.
+    Small differences receive progressively less evidence.
     """
 
     max_score = WEIGHTS["amount"]
@@ -136,31 +134,31 @@ def amount_score(
 
     try:
         settlement_amount = float(
-            settlement.get(
-                "net_settlement",
-                settlement.get(
-                    "net_amount"
+            settlement_amount
         )
-    )
-)
-        
 
         bank_amount = float(
             bank_amount
         )
 
     except (TypeError, ValueError):
+
         return 0.0
 
     if settlement_amount <= 0:
+
         return 0.0
 
     difference = abs(
         settlement_amount - bank_amount
     )
 
-    # Exact to normal currency precision.
+    # --------------------------------------------------------
+    # EXACT MATCH
+    # --------------------------------------------------------
+
     if difference <= 0.01:
+
         return max_score
 
     percentage_difference = (
@@ -169,111 +167,52 @@ def amount_score(
     ) * 100
 
     # --------------------------------------------------------
-    # Continuous evidence curve
+    # AMOUNT EVIDENCE CURVE
     # --------------------------------------------------------
     #
-    # 0%       -> 75
-    # 0.1%     -> ~73
-    # 0.5%     -> ~65
-    # 1%       -> ~55
-    # 2%       -> ~40
-    # 5%       -> ~15
-    # 10%+     -> 0
+    # The closer the bank credit is to the Razorpay
+    # net settlement, the stronger the evidence.
     #
-    # The exact values are produced continuously rather than
-    # by rigid categories.
+    # 0.00%  -> 100% of amount weight
+    # 0.10%  -> 98%
+    # 0.25%  -> 94%
+    # 0.50%  -> 87%
+    # 1.00%  -> 73%
+    # 2.00%  -> 53%
+    # 5.00%  -> 20%
+    # >10%   -> 0
+    #
     # --------------------------------------------------------
 
-    if percentage_difference >= 10:
-        return 0.0
+    if percentage_difference <= 0.10:
 
-    if percentage_difference <= 0.1:
+        return max_score * 0.98
 
-        score = max_score * (
-            1
-            - (
-                percentage_difference
-                / 0.1
-            ) * 0.025
-        )
+    if percentage_difference <= 0.25:
 
-    elif percentage_difference <= 0.5:
+        return max_score * 0.94
 
-        score = (
-            max_score * 0.975
-            - (
-                percentage_difference
-                - 0.1
-            )
-            / 0.4
-            * (
-                max_score * 0.10
-            )
-        )
+    if percentage_difference <= 0.50:
 
-    elif percentage_difference <= 1.0:
+        return max_score * 0.87
 
-        score = (
-            max_score * 0.875
-            - (
-                percentage_difference
-                - 0.5
-            )
-            / 0.5
-            * (
-                max_score * 0.15
-            )
-        )
+    if percentage_difference <= 1.00:
 
-    elif percentage_difference <= 2.0:
+        return max_score * 0.73
 
-        score = (
-            max_score * 0.725
-            - (
-                percentage_difference
-                - 1.0
-            )
-            / 1.0
-            * (
-                max_score * 0.20
-            )
-        )
+    if percentage_difference <= 2.00:
 
-    elif percentage_difference <= 5.0:
+        return max_score * 0.53
 
-        score = (
-            max_score * 0.525
-            - (
-                percentage_difference
-                - 2.0
-            )
-            / 3.0
-            * (
-                max_score * 0.325
-            )
-        )
+    if percentage_difference <= 5.00:
 
-    else:
+        return max_score * 0.20
 
-        score = (
-            max_score * 0.20
-            * (
-                1
-                - (
-                    percentage_difference
-                    - 5
-                )
-                / 5
-            )
-        )
+    if percentage_difference <= 10.00:
 
-    return max(
-        0.0,
-        min(
-            max_score,
-            score
-        )
-    )
+        return max_score * 0.05
+
+    return 0.0
 
 
 # ============================================================
@@ -549,6 +488,16 @@ def narration_score(narration):
 # ============================================================
 
 def calculate_evidence(settlement, bank_rows):
+    """
+    Calculate evidence for a Razorpay settlement -> bank statement match.
+
+    bank_rows may be:
+        1. A pandas DataFrame containing multiple bank rows
+        2. A pandas Series containing one bank row
+
+    For Razorpay lump-sum settlements, multiple bank credits
+    may collectively represent the settlement.
+    """
 
     settlement_amount = get_settlement_amount(
         settlement
@@ -564,13 +513,8 @@ def calculate_evidence(settlement, bank_rows):
         }
 
     # --------------------------------------------------------
-    # NORMALISE BANK INPUT
+    # NORMALIZE INPUT
     # --------------------------------------------------------
-    #
-    # Grouped reconciliation should pass a DataFrame.
-    # But if a single bank row is passed, convert it
-    # into a one-row DataFrame.
-    #
 
     if isinstance(bank_rows, pd.Series):
 
@@ -578,33 +522,45 @@ def calculate_evidence(settlement, bank_rows):
 
     elif not isinstance(bank_rows, pd.DataFrame):
 
-        bank_rows = pd.DataFrame(
-            [bank_rows]
-        )
+        return {
+            "amount_score": 0.0,
+            "date_score": 0.0,
+            "transaction_type_score": 0.0,
+            "narration_score": 0.0,
+            "base_score": 0.0,
+        }
+
+    if bank_rows.empty:
+
+        return {
+            "amount_score": 0.0,
+            "date_score": 0.0,
+            "transaction_type_score": 0.0,
+            "narration_score": 0.0,
+            "base_score": 0.0,
+        }
 
     # --------------------------------------------------------
-    # BANK AMOUNT
+    # AMOUNT
     # --------------------------------------------------------
 
-    bank_amount = round(
-        pd.to_numeric(
-            bank_rows["bank_amount"],
-            errors="coerce"
-        ).fillna(0).sum(),
+    bank_amounts = pd.to_numeric(
+        bank_rows["bank_amount"],
+        errors="coerce"
+    ).fillna(0.0)
+
+    total_bank_amount = round(
+        bank_amounts.sum(),
         2
     )
 
-    # --------------------------------------------------------
-    # AMOUNT EVIDENCE
-    # --------------------------------------------------------
-
     amount = amount_score(
         settlement_amount,
-        bank_amount
+        total_bank_amount
     )
 
     # --------------------------------------------------------
-    # BANK DATE
+    # DATE
     # --------------------------------------------------------
 
     bank_dates = bank_rows[
@@ -613,7 +569,9 @@ def calculate_evidence(settlement, bank_rows):
 
     if len(bank_dates) > 0:
 
-        bank_date = bank_dates.iloc[0]
+        # For a grouped settlement, use the latest
+        # credit date as the settlement arrival date.
+        bank_date = bank_dates.max()
 
     else:
 
@@ -628,20 +586,20 @@ def calculate_evidence(settlement, bank_rows):
     # TRANSACTION TYPE
     # --------------------------------------------------------
 
-    transaction_type = (
-        group_transaction_type_score(
-            bank_rows
-        )
+    transaction_type = group_transaction_type_score(
+        bank_rows
     )
 
     # --------------------------------------------------------
     # NARRATION
     # --------------------------------------------------------
 
-    narration = (
-        group_narration_score(
-            bank_rows
-        )
+    narrations = bank_rows[
+        "narration"
+    ].dropna().astype(str)
+
+    narration = group_narration_score(
+        bank_rows
     )
 
     # --------------------------------------------------------
@@ -671,6 +629,13 @@ def calculate_evidence(settlement, bank_rows):
 
         "base_score":
             round(base_score, 2),
+
+        # Useful for debugging/output
+        "bank_total":
+            total_bank_amount,
+
+        "bank_row_count":
+            len(bank_rows),
     }
 
 def group_transaction_type_score(bank_rows):

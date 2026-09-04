@@ -445,7 +445,7 @@ def determine_status(
 def match_settlement(
     settlement,
     bank,
-    index
+    claimed_bank_indices
 ):
     """
     Find the best bank statement candidate for one
