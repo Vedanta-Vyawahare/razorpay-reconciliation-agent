@@ -1,107 +1,97 @@
+"""
+Purpose
+-------
+Calculates deterministic evidence strength for a possible:
 
-"""Purpose:
-Calculates the evidence strength for a possible Razorpay settlement → bank statement match.
+    Razorpay Settlement -> Bank Statement
 
-The confidence model consists of:
+Confidence model
+----------------
+Amount relationship       : 75 points
+Settlement timing         : 15 points
+Transaction type          : 7 points
+Narration                 : 3 points
+                            ----
+                            100 points
 
-Amount relationship: 75%
-Settlement timing: 15%
-Transaction type: 7%
-Narration: 3%
+Important
+---------
+These are EVIDENCE POINTS, not statistical probabilities.
 
-Amount receives the highest weight because the Razorpay settlement amount represents the expected settlement value.
+Ambiguity is handled separately in matching.py and can apply
+a small penalty of 0% to 1%.
 
-Settlement timing is evaluated using business days rather than simple calendar-day differences.
+This file does NOT decide which candidate wins.
+It only calculates how much evidence each candidate provides.
+"""
 
-Bank transaction type verifies that the candidate represents a plausible incoming settlement.
-
-Narration provides additional supporting evidence when Razorpay-related identifiers such as RZPY or RAZORPAY are present.
-
-This file calculates evidence but does not resolve competition between multiple candidates."""
-
-
-# ============================================================
-# EVIDENCE SCORING
-# Razorpay Settlement -> Bank Statement
-# ============================================================
+import pandas as pd
 
 from config import WEIGHTS, RAZORPAY_KEYWORDS
+
 from datetime import timedelta
 
 
-def amount_score(settlement_amount, bank_amount):
+# ============================================================
+# HELPERS
+# ============================================================
+
+def pd_is_missing(value):
     """
-    Amount evidence: maximum 75 points.
-
-    The score is continuous rather than simply
-    75 or 0.
+    Safely determine whether a value is missing.
     """
 
-    if settlement_amount is None or bank_amount is None:
-        return 0.0
+    if value is None:
+        return True
 
-    difference = abs(
-        settlement_amount - bank_amount
-    )
-
-    if difference <= 0.01:
-        return 75.0
-
-    percentage_difference = (
-        difference / settlement_amount
-    ) * 100
-
-    if percentage_difference <= 0.01:
-        return 74.0
-
-    if percentage_difference <= 0.05:
-        return 72.0
-
-    if percentage_difference <= 0.10:
-        return 69.0
-
-    if percentage_difference <= 0.25:
-        return 64.0
-
-    if percentage_difference <= 0.50:
-        return 55.0
-
-    if percentage_difference <= 1.00:
-        return 45.0
-
-    if percentage_difference <= 2.00:
-        return 30.0
-
-    if percentage_difference <= 5.00:
-        return 15.0
-
-    if percentage_difference <= 10.00:
-        return 5.0
-
-    return 0.0
+    try:
+        return pd.isna(value)
+    except Exception:
+        return False
 
 
 def business_day_difference(date1, date2):
     """
-    Count weekdays between two dates.
+    Calculate the signed number of business days between two dates.
 
-    Holiday intelligence will be added later.
+    Positive:
+        date2 occurs after date1.
+
+    Negative:
+        date2 occurs before date1.
+
+    Example:
+
+        Monday -> Tuesday = +1
+        Monday -> Wednesday = +2
+        Monday -> Friday = +4
+
+        Tuesday -> Monday = -1
+
+    Weekends are ignored.
+
+    Bank-holiday intelligence is intentionally NOT handled here.
     """
 
-    if pd_is_missing(date1) or pd_is_missing(date2):
+    if (
+        pd_is_missing(date1)
+        or pd_is_missing(date2)
+    ):
         return None
 
-    date1 = date1.normalize()
-    date2 = date2.normalize()
+    date1 = pd.Timestamp(date1).normalize()
+    date2 = pd.Timestamp(date2).normalize()
 
     if date1 == date2:
         return 0
 
+    direction = 1 if date2 > date1 else -1
+
     start = min(date1, date2)
     end = max(date1, date2)
 
-    business_days = 0
     current = start
+    business_days = 0
 
     while current < end:
 
@@ -110,58 +100,361 @@ def business_day_difference(date1, date2):
         if current.weekday() < 5:
             business_days += 1
 
-    return business_days
+    return business_days * direction
 
 
-def pd_is_missing(value):
+# ============================================================
+# AMOUNT EVIDENCE
+# ============================================================
+
+def amount_score(
+    settlement_amount,
+    bank_amount
+):
+    """
+    Amount evidence.
+
+    Maximum:
+        WEIGHTS["amount"]
+
+    The score decreases continuously as the percentage
+    difference increases.
+
+    Exact settlement amount receives the full amount weight.
+
+    This is deliberately much more sensitive than the old
+    EXACT / SMALL / MODERATE / LARGE buckets.
+    """
+
+    max_score = WEIGHTS["amount"]
+
+    if (
+        settlement_amount is None
+        or bank_amount is None
+    ):
+        return 0.0
+
     try:
-        return value is None or value is pd.NaT
-    except Exception:
-        return value is None
+        settlement_amount = float(
+            settlement_amount
+        )
+
+        bank_amount = float(
+            bank_amount
+        )
+
+    except (TypeError, ValueError):
+        return 0.0
+
+    if settlement_amount <= 0:
+        return 0.0
+
+    difference = abs(
+        settlement_amount - bank_amount
+    )
+
+    # Exact to normal currency precision.
+    if difference <= 0.01:
+        return max_score
+
+    percentage_difference = (
+        difference
+        / settlement_amount
+    ) * 100
+
+    # --------------------------------------------------------
+    # Continuous evidence curve
+    # --------------------------------------------------------
+    #
+    # 0%       -> 75
+    # 0.1%     -> ~73
+    # 0.5%     -> ~65
+    # 1%       -> ~55
+    # 2%       -> ~40
+    # 5%       -> ~15
+    # 10%+     -> 0
+    #
+    # The exact values are produced continuously rather than
+    # by rigid categories.
+    # --------------------------------------------------------
+
+    if percentage_difference >= 10:
+        return 0.0
+
+    if percentage_difference <= 0.1:
+
+        score = max_score * (
+            1
+            - (
+                percentage_difference
+                / 0.1
+            ) * 0.025
+        )
+
+    elif percentage_difference <= 0.5:
+
+        score = (
+            max_score * 0.975
+            - (
+                percentage_difference
+                - 0.1
+            )
+            / 0.4
+            * (
+                max_score * 0.10
+            )
+        )
+
+    elif percentage_difference <= 1.0:
+
+        score = (
+            max_score * 0.875
+            - (
+                percentage_difference
+                - 0.5
+            )
+            / 0.5
+            * (
+                max_score * 0.15
+            )
+        )
+
+    elif percentage_difference <= 2.0:
+
+        score = (
+            max_score * 0.725
+            - (
+                percentage_difference
+                - 1.0
+            )
+            / 1.0
+            * (
+                max_score * 0.20
+            )
+        )
+
+    elif percentage_difference <= 5.0:
+
+        score = (
+            max_score * 0.525
+            - (
+                percentage_difference
+                - 2.0
+            )
+            / 3.0
+            * (
+                max_score * 0.325
+            )
+        )
+
+    else:
+
+        score = (
+            max_score * 0.20
+            * (
+                1
+                - (
+                    percentage_difference
+                    - 5
+                )
+                / 5
+            )
+        )
+
+    return max(
+        0.0,
+        min(
+            max_score,
+            score
+        )
+    )
 
 
-def date_score(settlement_date, bank_date):
+# ============================================================
+# SETTLEMENT TIMING EVIDENCE
+# ============================================================
+
+def expected_cycle(settlement):
     """
-    Date evidence: maximum 15 points.
+    Determine the expected settlement cycle.
 
-    Settlement timing is evaluated in business days.
+    Examples:
+
+        standard_t+2
+        merchant_t+1
+        instant_t+0
+
+    The settlement dataset is the source of truth for the
+    expected cycle.
     """
 
-    difference = business_day_difference(
+    cycle = str(
+        settlement.get(
+            "settlement_cycle",
+            ""
+        )
+    ).lower()
+
+    if "t+0" in cycle:
+        return 0
+
+    if "t+1" in cycle:
+        return 1
+
+    if "t+2" in cycle:
+        return 2
+
+    return None
+
+
+def date_score(
+    settlement,
+    bank_date
+):
+    """
+    Settlement timing evidence.
+
+    Maximum:
+        WEIGHTS["date"]
+
+    The score is based on the EXPECTED settlement cycle.
+
+    Example:
+
+        merchant_t+1
+
+        actual T+1
+            -> maximum timing evidence
+
+        actual T+2
+            -> still plausible, but weaker
+
+        actual T+3
+            -> weaker again
+
+        actual T-1
+            -> very weak
+
+    This function deliberately does not hardcode bank holidays.
+    """
+
+    max_score = WEIGHTS["date"]
+
+    settlement_date = settlement.get(
+        "settlement_date"
+    )
+
+    if (
+        pd_is_missing(settlement_date)
+        or pd_is_missing(bank_date)
+    ):
+        return 0.0
+
+    expected_days = expected_cycle(
+        settlement
+    )
+
+    if expected_days is None:
+        return max_score * 0.40
+
+    actual_days = business_day_difference(
         settlement_date,
         bank_date
     )
 
-    if difference is None:
+    if actual_days is None:
         return 0.0
 
-    if difference == 0:
-        return 15.0
+    deviation = (
+        actual_days
+        - expected_days
+    )
 
-    if difference == 1:
-        return 13.5
+    # --------------------------------------------------------
+    # Exact expected settlement day
+    # --------------------------------------------------------
 
-    if difference == 2:
-        return 11.5
+    if deviation == 0:
+        return max_score
 
-    if difference == 3:
-        return 8.5
+    # --------------------------------------------------------
+    # One business day late
+    # Still plausible.
+    # --------------------------------------------------------
 
-    if difference == 4:
-        return 5.0
+    if deviation == 1:
+        return max_score * 0.90
 
-    if difference == 5:
-        return 2.0
+    # --------------------------------------------------------
+    # Two business days late
+    # Possible, but weaker.
+    # --------------------------------------------------------
 
+    if deviation == 2:
+        return max_score * 0.70
+
+    # --------------------------------------------------------
+    # Three business days late
+    # --------------------------------------------------------
+
+    if deviation == 3:
+        return max_score * 0.45
+
+    # --------------------------------------------------------
+    # Four business days late
+    # --------------------------------------------------------
+
+    if deviation == 4:
+        return max_score * 0.25
+
+    # --------------------------------------------------------
+    # Early settlement.
+    #
+    # T+1 expected but T+0 observed:
+    # possible in some cases, but should not receive full
+    # timing evidence.
+    # --------------------------------------------------------
+
+    if deviation == -1:
+
+        return max_score * 0.55
+
+    # More than one business day early is suspicious.
+    if deviation < -1:
+
+        return max_score * 0.15
+
+    # Far outside expected window.
     return 0.0
 
 
+# ============================================================
+# TRANSACTION TYPE EVIDENCE
+# ============================================================
+
 def transaction_type_score(bank_row):
     """
-    Transaction type evidence: maximum 7 points.
+    Transaction type evidence.
+
+    Maximum:
+        WEIGHTS["transaction_type"]
+
+    Razorpay settlements normally arrive as incoming
+    bank credits.
+
+    NEFT / IMPS / RTGS are strong transfer mechanisms.
+
+    Generic incoming transfers provide weaker evidence.
     """
 
-    if not bank_row.get("is_credit", False):
+    max_score = WEIGHTS[
+        "transaction_type"
+    ]
+
+    if not bank_row.get(
+        "is_credit",
+        False
+    ):
         return 0.0
 
     transaction_type = str(
@@ -171,57 +464,125 @@ def transaction_type_score(bank_row):
         )
     ).upper()
 
-    if transaction_type == "NEFT":
-        return 7.0
-
-    if transaction_type == "IMPS":
-        return 7.0
-
-    if transaction_type == "RTGS":
-        return 7.0
+    if transaction_type in {
+        "NEFT",
+        "IMPS",
+        "RTGS"
+    }:
+        return max_score
 
     if transaction_type == "TRANSFER":
-        return 5.0
+        return max_score * 0.70
 
-    return 2.0
+    if transaction_type in {
+        "UPI",
+        "CREDIT"
+    }:
+        return max_score * 0.40
 
+    return max_score * 0.15
+
+
+# ============================================================
+# NARRATION EVIDENCE
+# ============================================================
 
 def narration_score(narration):
     """
-    Narration evidence: maximum 3 points.
+    Narration evidence.
+
+    Maximum:
+        WEIGHTS["narration"]
+
+    This is deliberately a supporting signal.
+
+    We should NOT make narration a primary matching key
+    because bank narrations are inconsistent.
     """
 
-    if not narration:
+    max_score = WEIGHTS[
+        "narration"
+    ]
+
+    if pd_is_missing(narration):
         return 0.0
 
-    text = str(narration).upper()
+    text = str(
+        narration
+    ).upper()
 
-    for keyword in RAZORPAY_KEYWORDS:
+    # Strong Razorpay identifiers.
+    strong_keywords = [
+        keyword.upper()
+        for keyword in RAZORPAY_KEYWORDS
+    ]
+
+    for keyword in strong_keywords:
 
         if keyword in text:
-            return 3.0
+            return max_score
 
-    return 0.5
+    # Generic settlement wording is weak evidence.
+    weak_terms = [
+        "SETTLEMENT",
+        "PAYOUT",
+        "PAYMENT GATEWAY",
+        "PG"
+    ]
+
+    for term in weak_terms:
+
+        if term in text:
+            return max_score * 0.40
+
+    return 0.0
 
 
-def calculate_evidence(settlement, bank_row):
+# ============================================================
+# COMPLETE EVIDENCE
+# ============================================================
+
+def calculate_evidence(
+    settlement,
+    bank_row
+):
+    """
+    Calculate all deterministic evidence for one:
+
+        Razorpay settlement -> bank transaction
+
+    candidate.
+
+    Returns individual evidence components plus the
+    total deterministic evidence score.
+    """
 
     amount = amount_score(
-        settlement["net_amount"],
-        bank_row["bank_amount"]
+        settlement.get(
+            "net_amount"
+        ),
+        bank_row.get(
+            "bank_amount"
+        )
     )
 
     date = date_score(
-        settlement["settlement_date"],
-        bank_row["bank_date"]
+        settlement,
+        bank_row.get(
+            "bank_date"
+        )
     )
 
-    transaction_type = transaction_type_score(
-        bank_row
+    transaction_type = (
+        transaction_type_score(
+            bank_row
+        )
     )
 
     narration = narration_score(
-        bank_row["narration"]
+        bank_row.get(
+            "narration"
+        )
     )
 
     base_score = (
@@ -232,18 +593,34 @@ def calculate_evidence(settlement, bank_row):
     )
 
     return {
-        "amount_score": round(amount, 2),
-        "date_score": round(date, 2),
-        "transaction_type_score": round(
-            transaction_type,
-            2
-        ),
-        "narration_score": round(
-            narration,
-            2
-        ),
-        "base_score": round(
-            base_score,
-            2
-        ),
+
+        "amount_score":
+            round(
+                amount,
+                2
+            ),
+
+        "date_score":
+            round(
+                date,
+                2
+            ),
+
+        "transaction_type_score":
+            round(
+                transaction_type,
+                2
+            ),
+
+        "narration_score":
+            round(
+                narration,
+                2
+            ),
+
+        "base_score":
+            round(
+                base_score,
+                2
+            )
     }

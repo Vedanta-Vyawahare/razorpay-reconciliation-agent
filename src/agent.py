@@ -53,44 +53,50 @@ def reconcile():
     bank = prepare_bank_statement(
         bank
     )
-
+    claimed_bank_indices = set()
+    results = []
     # --------------------------------------------------------
     # MATCH
     # --------------------------------------------------------
 
-    results = []
-
-    claimed_bank_indices = set()
 
     for _, settlement in settlements.iterrows():
 
         result = match_settlement(
             settlement,
-            bank[
-                ~bank.index.isin(
-                    claimed_bank_indices
-                )
-            ]
+            bank,
+            claimed_bank_indices
         )
 
         if result["bank_index"] is not None:
 
             selected_index = result["bank_index"]
 
-            claimed_bank_indices.add(
-                selected_index
-            )
-
             bank_row = bank.loc[
                 selected_index
             ]
 
-            # Your actual bank CSV uses:
-            # ref_no_cheque_no
-            bank_reference = bank_row["bank_reference"]
+            bank_reference = bank_row[
+                "bank_reference"
+            ]
 
-            bank_date = bank_row["bank_date"]
-            bank_amount = bank_row["bank_amount"]
+            bank_date = bank_row[
+                "bank_date"
+            ]
+
+            bank_amount = bank_row[
+                "bank_amount"
+            ]
+
+            # Only consume the bank transaction when
+            # the system actually accepts the match.
+            if result["status"] in [
+                "MATCHED",
+                "LIKELY_MATCH"
+            ]:
+                claimed_bank_indices.add(
+                    selected_index
+                )
 
         else:
 
@@ -123,6 +129,10 @@ def reconcile():
             "bank_credit":
                 bank_amount,
 
+            # -----------------------------
+            # Evidence breakdown
+            # -----------------------------
+
             "amount_score":
                 (
                     result["evidence"]["amount_score"]
@@ -153,14 +163,19 @@ def reconcile():
                     else 0
                 ),
 
+            "base_score":
+                (
+                    result["evidence"]["base_score"]
+                    if result["evidence"]
+                    else 0
+                ),
+
+            # -----------------------------
+            # Ambiguity
+            # -----------------------------
+
             "ambiguity_penalty":
                 result["ambiguity_penalty"],
-
-            "confidence":
-                result["confidence"],
-
-            "status":
-                result["status"],
 
             "ambiguity_type":
                 result.get(
@@ -168,11 +183,49 @@ def reconcile():
                     "none"
                 ),
 
+            # -----------------------------
+            # Candidate information
+            # -----------------------------
+
             "candidate_count":
                 result.get(
                     "candidate_count",
                     0
                 ),
+
+            "top_candidate_2_score":
+                (
+                    result["candidate_rankings"][1]["score"]
+                    if len(
+                        result.get(
+                            "candidate_rankings",
+                            []
+                        )
+                    ) > 1
+                    else None
+                ),
+
+            "top_candidate_3_score":
+                (
+                    result["candidate_rankings"][2]["score"]
+                    if len(
+                        result.get(
+                            "candidate_rankings",
+                            []
+                        )
+                    ) > 2
+                    else None
+                ),
+
+            # -----------------------------
+            # Final result
+            # -----------------------------
+
+            "confidence":
+                result["confidence"],
+
+            "status":
+                result["status"],
         })
 
     results_df = pd.DataFrame(results)

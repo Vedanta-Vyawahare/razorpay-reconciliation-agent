@@ -1,2 +1,1 @@
-settlement_id,settlement_date,razorpay_net_settlement,bank_reference,bank_date,bank_credit,amount_score,date_score,transaction_type_score,narration_score,ambiguity_penalty,confidence,status,ambiguity_type,candidate_count
-setl_0010,2026-06-30,136799.6,AXIS461704,2026-07-06,137186.15,55.0,5.0,7.0,3.0,0.0,70.0,REVIEW,none,57
+settlement_id,settlement_date,razorpay_net_settlement,bank_reference,bank_date,bank_credit,amount_score,date_score,transaction_type_score,narration_score,base_score,ambiguity_penalty,ambiguity_type,candidate_count,top_candidate_2_score,top_candidate_3_score,confidence,status

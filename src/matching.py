@@ -1,38 +1,28 @@
-"""Documentation for matching.py
-
-Purpose:
-Matches each Razorpay settlement against possible bank statement credits.
-
-The engine:
-
-Removes bank debits from consideration.
-Scores each possible bank credit.
-Ranks candidates by evidence strength.
-Checks whether competing candidates are nearly as strong.
-Applies a small ambiguity penalty of up to 1%.
-Produces a final confidence score.
-
-Current result categories:
-
-MATCHED: confidence ≥ 95%
-LIKELY_MATCH: confidence ≥ 80%
-REVIEW: confidence ≥ 60%
-UNMATCHED: confidence < 60%
-
-Ambiguity does not dominate the score. It only slightly reduces confidence when multiple candidates are similarly plausible."""
-
 from evidence import calculate_evidence
 from config import AMBIGUITY_PENALTIES
 
 
-def find_candidates(settlement, bank_df):
+def find_candidates(settlement, bank_df, claimed_bank_indices):
+    """
+    Find all plausible incoming bank transactions.
+
+    IMPORTANT:
+    We do not throw away a candidate merely because
+    its amount is different.
+
+    The evidence layer decides how strong the candidate is.
+    """
 
     candidates = []
 
     for index, bank_row in bank_df.iterrows():
 
-        # Only incoming money can represent
-        # a normal Razorpay settlement.
+        # Already accepted by another settlement.
+        if index in claimed_bank_indices:
+            continue
+
+        # Razorpay settlement should normally appear
+        # as an incoming bank credit.
         if not bank_row["is_credit"]:
             continue
 
@@ -41,20 +31,26 @@ def find_candidates(settlement, bank_df):
             bank_row
         )
 
-        # Keep candidates with SOME evidence.
-        # We no longer require amount to be close.
         if evidence["base_score"] <= 0:
             continue
 
         candidates.append({
             "bank_index": index,
-            "evidence": evidence,
+            "evidence": evidence
         })
 
     return candidates
 
 
 def determine_ambiguity(best, candidates):
+    """
+    Compare the best candidate against competing candidates.
+
+    Ambiguity is intentionally a SMALL penalty.
+
+    A strong match should remain strong even when
+    another weak candidate exists.
+    """
 
     if len(candidates) <= 1:
         return 0.0, "none"
@@ -62,8 +58,9 @@ def determine_ambiguity(best, candidates):
     best_score = best["evidence"]["base_score"]
 
     competitors = [
-        c for c in candidates
-        if c["bank_index"] != best["bank_index"]
+        candidate
+        for candidate in candidates
+        if candidate["bank_index"] != best["bank_index"]
     ]
 
     strong_competitors = []
@@ -74,12 +71,13 @@ def determine_ambiguity(best, candidates):
             candidate["evidence"]["base_score"]
         )
 
-        difference = (
+        score_difference = (
             best_score - candidate_score
         )
 
-        # Candidate is genuinely close to the winner.
-        if difference <= 2:
+        # Candidate is close enough to deserve
+        # ambiguity consideration.
+        if score_difference <= 2:
             strong_competitors.append(
                 candidate
             )
@@ -124,11 +122,43 @@ def determine_ambiguity(best, candidates):
     )
 
 
-def match_settlement(settlement, bank_df):
+def get_status(confidence):
+    """
+    Convert evidence confidence into a reconciliation state.
+    """
+
+    if confidence >= 95:
+        return "MATCHED"
+
+    if confidence >= 80:
+        return "LIKELY_MATCH"
+
+    if confidence >= 60:
+        return "REVIEW"
+
+    return "UNMATCHED"
+
+
+def match_settlement(
+    settlement,
+    bank_df,
+    claimed_bank_indices
+):
+    """
+    Match one Razorpay settlement against the bank statement.
+
+    Returns:
+        - best candidate
+        - confidence
+        - complete evidence breakdown
+        - candidate ranking
+        - ambiguity information
+    """
 
     candidates = find_candidates(
         settlement,
-        bank_df
+        bank_df,
+        claimed_bank_indices
     )
 
     if not candidates:
@@ -141,11 +171,13 @@ def match_settlement(settlement, bank_df):
             "ambiguity_penalty": 0.0,
             "ambiguity_type": "none",
             "candidate_count": 0,
+            "candidate_rankings": []
         }
 
     # Highest evidence first.
     candidates.sort(
-        key=lambda x: x["evidence"]["base_score"],
+        key=lambda candidate:
+        candidate["evidence"]["base_score"],
         reverse=True
     )
 
@@ -164,27 +196,68 @@ def match_settlement(settlement, bank_df):
         - ambiguity_penalty
     )
 
-    if final_confidence >= 95:
-        status = "MATCHED"
+    status = get_status(
+        final_confidence
+    )
 
-    elif final_confidence >= 80:
-        status = "LIKELY_MATCH"
+    # --------------------------------------------------
+    # Save ranked candidates for auditing.
+    # --------------------------------------------------
 
-    elif final_confidence >= 60:
-        status = "REVIEW"
+    candidate_rankings = []
 
-    else:
-        status = "UNMATCHED"
+    for rank, candidate in enumerate(
+        candidates[:5],
+        start=1
+    ):
+
+        evidence = candidate["evidence"]
+
+        candidate_rankings.append({
+            "rank": rank,
+            "bank_index": candidate["bank_index"],
+            "score": round(
+                evidence["base_score"],
+                2
+            ),
+            "amount_score": round(
+                evidence["amount_score"],
+                2
+            ),
+            "date_score": round(
+                evidence["date_score"],
+                2
+            ),
+            "transaction_type_score": round(
+                evidence["transaction_type_score"],
+                2
+            ),
+            "narration_score": round(
+                evidence["narration_score"],
+                2
+            )
+        })
 
     return {
         "status": status,
+
         "confidence": round(
             final_confidence,
             2
         ),
+
         "bank_index": best["bank_index"],
+
         "evidence": best["evidence"],
-        "ambiguity_penalty": ambiguity_penalty,
+
+        "ambiguity_penalty": round(
+            ambiguity_penalty,
+            2
+        ),
+
         "ambiguity_type": ambiguity_type,
+
         "candidate_count": len(candidates),
+
+        "candidate_rankings": candidate_rankings
     }
