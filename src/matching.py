@@ -1,60 +1,75 @@
 """
-Purpose
--------
+Razorpay Settlement -> Bank Statement Matching Engine
 
-Matches Razorpay settlement records against bank statement credits.
+Responsibilities
+----------------
+1. Generate valid bank candidates for a Razorpay settlement.
+2. Score ALL valid candidates.
+3. Rank candidates by evidence score.
+4. Resolve competition between candidates.
+5. Claim a bank row only when the winner is sufficiently strong.
+6. Never reuse a claimed bank transaction.
+7. Explain why a score is below 100.
 
-This is the candidate-selection layer.
+Important
+---------
+evidence.py calculates the individual evidence components.
 
-The matching process is deliberately separated into two stages:
-
-    1. Evidence generation
-       -> handled by evidence.py
-
-    2. Candidate selection + ambiguity handling
-       -> handled here
-
-The model does NOT assume that the Razorpay UTR must appear
-in the bank statement.
-
-Primary evidence:
-    - Net settlement amount
-    - Settlement date / business-day relationship
-
-Supporting evidence:
-    - Incoming transaction type
-    - Razorpay-related narration
-
-Ambiguity is treated as a small penalty rather than destroying
-a strong match.
-
-The final score is:
-
-    evidence score - ambiguity penalty
-
-The maximum evidence score is 100.
+This file is responsible for:
+    - candidate generation
+    - candidate ranking
+    - ambiguity handling
+    - final decision
+    - claim safety
 """
 
+import pandas as pd
 
-from evidence import calculate_evidence
+
+from evidence import (
+    calculate_evidence,
+)
 
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
 
-MATCH_THRESHOLD = 75.0
-REVIEW_THRESHOLD = 55.0
+# A candidate must reach this score before it can be
+# automatically claimed when there is competition.
+CLAIM_THRESHOLD = 95.0
 
-# Maximum date window considered for settlement matching.
+
+# When two strong candidates are very close, do not
+# automatically choose one.
+AMBIGUITY_MARGIN = 3.0
+
+
+# Minimum score below which a candidate is generally
+# not considered a meaningful candidate.
+MIN_CANDIDATE_SCORE = 50.0
+
+
+# Candidate generation tolerances.
 #
-# This is intentionally not treated as a fixed settlement rule.
-# The actual date score is calculated by evidence.py.
-MAX_BUSINESS_DAY_WINDOW = 5
+# We intentionally allow a reasonably wide amount window
+# during candidate discovery. The evidence engine then
+# decides how strong the amount relationship actually is.
+AMOUNT_TOLERANCE_PERCENT = 10.0
+
+
+# Date search window.
+#
+# The settlement_date in the Razorpay settlement file
+# represents the date on which the settlement is expected
+# to reach the merchant bank.
+#
+# Bank posting can occasionally happen around that date.
+DATE_WINDOW_BUSINESS_DAYS = 3
 
 
 # ============================================================
-# HELPERS
+# BASIC HELPERS
 # ============================================================
 
 def safe_float(value):
@@ -63,23 +78,30 @@ def safe_float(value):
     """
 
     try:
+
         if value is None:
+            return None
+
+        if pd.isna(value):
             return None
 
         return float(value)
 
-    except (ValueError, TypeError):
+    except (TypeError, ValueError):
+
         return None
 
 
 def get_settlement_amount(settlement):
     """
-    Retrieve the Razorpay net settlement amount.
+    Retrieve Razorpay net settlement amount.
 
-    Supports the current field:
+    Supports both:
+
         net_settlement
 
-    and the older internal field:
+    and:
+
         net_amount
     """
 
@@ -95,20 +117,11 @@ def get_settlement_amount(settlement):
 
 def get_bank_amount(bank_row):
     """
-    Retrieve the incoming bank credit amount.
-
-    Supports the normalized field:
-        bank_amount
-
-    and the original CSV field:
-        credit
+    Retrieve normalized bank credit amount.
     """
 
     value = bank_row.get(
-        "bank_amount",
-        bank_row.get(
-            "credit"
-        )
+        "bank_amount"
     )
 
     return safe_float(value)
@@ -116,89 +129,324 @@ def get_bank_amount(bank_row):
 
 def get_bank_date(bank_row):
     """
-    Retrieve normalized bank transaction date.
+    Retrieve normalized bank date.
     """
 
-    return bank_row.get(
-        "bank_date",
-        bank_row.get(
-            "post_date",
-            bank_row.get(
-                "value_date"
-            )
-        )
+    value = bank_row.get(
+        "bank_date"
     )
 
+    if value is None:
+        return None
 
-def get_bank_reference(bank_row, index):
+    try:
+
+        if pd.isna(value):
+            return None
+
+    except Exception:
+
+        return None
+
+    return pd.Timestamp(value)
+
+
+def get_settlement_date(settlement):
     """
-    Get the bank reference.
-
-    The bank statement may contain:
-
-        ref_no_cheque_no
-
-    rather than a Razorpay UTR.
-
-    Therefore this is only used for identification,
-    not as a mandatory matching criterion.
+    Retrieve Razorpay settlement date.
     """
 
-    return bank_row.get(
-        "bank_reference",
-        bank_row.get(
-            "ref_no_cheque_no",
-            bank_row.get(
-                "reference",
-                index
-            )
-        )
+    value = settlement.get(
+        "settlement_date"
     )
+
+    if value is None:
+        return None
+
+    try:
+
+        if pd.isna(value):
+            return None
+
+    except Exception:
+
+        return None
+
+    return pd.Timestamp(value)
 
 
 def is_credit_transaction(bank_row):
     """
-    Confirm that the bank row represents money entering
-    the merchant account.
-
-    Debit transactions must never become settlement matches.
+    Check whether a bank row represents an incoming credit.
     """
 
-    if "is_credit" in bank_row:
-        return bool(
-            bank_row["is_credit"]
-        )
-
-    credit = safe_float(
-        bank_row.get("credit", 0)
+    value = bank_row.get(
+        "is_credit",
+        False
     )
 
-    return credit is not None and credit > 0
+    if isinstance(value, bool):
+        return value
+
+    text = str(value).strip().upper()
+
+    return text in {
+        "TRUE",
+        "1",
+        "YES",
+        "Y"
+    }
 
 
 # ============================================================
-# CANDIDATE FILTERING
+# DATE / SETTLEMENT CYCLE HELPERS
 # ============================================================
 
-def is_possible_candidate(settlement, bank_row):
+def business_day_distance(date1, date2):
     """
-    Decide whether a bank row is worth scoring.
+    Absolute business-day distance between two dates.
 
-    We do NOT require:
-        - UTR equality
-        - narration equality
-        - exact date equality
+    Weekends are ignored.
 
-    because real bank statements may not expose the same
-    identifiers as the Razorpay settlement report.
+    Example:
 
-    We DO require:
-        - incoming credit
-        - usable amount
-        - usable date
+        Monday -> Monday = 0
+        Monday -> Tuesday = 1
+        Monday -> Wednesday = 2
     """
 
-    if not is_credit_transaction(bank_row):
+    if date1 is None or date2 is None:
+        return None
+
+    date1 = pd.Timestamp(date1).normalize()
+    date2 = pd.Timestamp(date2).normalize()
+
+    if date1 == date2:
+        return 0
+
+    start = min(
+        date1,
+        date2
+    )
+
+    end = max(
+        date1,
+        date2
+    )
+
+    current = start
+    days = 0
+
+    while current < end:
+
+        current += pd.Timedelta(
+            days=1
+        )
+
+        if current.weekday() < 5:
+            days += 1
+
+    return days
+
+
+def signed_business_day_difference(
+    date1,
+    date2
+):
+    """
+    Signed business-day difference.
+
+    Positive:
+        date2 is after date1.
+
+    Negative:
+        date2 is before date1.
+    """
+
+    if date1 is None or date2 is None:
+        return None
+
+    date1 = pd.Timestamp(date1).normalize()
+    date2 = pd.Timestamp(date2).normalize()
+
+    if date1 == date2:
+        return 0
+
+    direction = 1 if date2 > date1 else -1
+
+    return (
+        business_day_distance(
+            date1,
+            date2
+        )
+        * direction
+    )
+
+
+def get_cycle_type(settlement):
+    """
+    Normalize settlement cycle.
+
+    Examples:
+
+        merchant_t+1
+        standard_t+2
+        instant_t+0
+    """
+
+    cycle = str(
+        settlement.get(
+            "settlement_cycle",
+            ""
+        )
+    ).strip().lower()
+
+    return cycle
+
+
+def cycle_expected_window(settlement):
+    """
+    Determine the expected bank-date tolerance based
+    on the settlement cycle.
+
+    IMPORTANT:
+
+    settlement_date is already the Razorpay settlement date,
+    i.e. the date the settlement is supposed to reach the
+    merchant.
+
+    Therefore we DO NOT add T+1/T+2 to settlement_date.
+
+    Instead, settlement_cycle tells us how strict we should
+    be about bank posting around the settlement date.
+    """
+
+    cycle = get_cycle_type(
+        settlement
+    )
+
+    if "t+0" in cycle:
+        return 0
+
+    if "t+1" in cycle:
+        return 1
+
+    if "t+2" in cycle:
+        return 2
+
+    # Unknown cycle:
+    # use the general tolerance.
+    return DATE_WINDOW_BUSINESS_DAYS
+
+
+# ============================================================
+# AMOUNT CANDIDATE FILTER
+# ============================================================
+
+def amount_within_candidate_window(
+    settlement_amount,
+    bank_amount
+):
+    """
+    Decide whether a bank amount is close enough to even
+    consider as a candidate.
+
+    This is ONLY candidate discovery.
+
+    Final amount strength comes from evidence.py.
+    """
+
+    if (
+        settlement_amount is None
+        or bank_amount is None
+    ):
+        return False
+
+    if settlement_amount <= 0:
+        return False
+
+    difference = abs(
+        settlement_amount
+        - bank_amount
+    )
+
+    percentage_difference = (
+        difference
+        / settlement_amount
+    ) * 100
+
+    return (
+        percentage_difference
+        <= AMOUNT_TOLERANCE_PERCENT
+    )
+
+
+# ============================================================
+# DATE CANDIDATE FILTER
+# ============================================================
+
+def date_within_candidate_window(
+    settlement,
+    bank_row
+):
+    """
+    Determine whether a bank row is close enough in time
+    to be considered a candidate.
+
+    settlement_cycle controls the allowed business-day
+    tolerance.
+    """
+
+    settlement_date = get_settlement_date(
+        settlement
+    )
+
+    bank_date = get_bank_date(
+        bank_row
+    )
+
+    if (
+        settlement_date is None
+        or bank_date is None
+    ):
+        return False
+
+    distance = business_day_distance(
+        settlement_date,
+        bank_date
+    )
+
+    if distance is None:
+        return False
+
+    cycle_window = cycle_expected_window(
+        settlement
+    )
+
+    # Never allow an unlimited date window.
+    allowed_window = max(
+        cycle_window,
+        DATE_WINDOW_BUSINESS_DAYS
+    )
+
+    return distance <= allowed_window
+
+
+# ============================================================
+# CANDIDATE VALIDATION
+# ============================================================
+
+def valid_candidate(
+    settlement,
+    bank_row
+):
+    """
+    Basic candidate validation.
+    """
+
+    if not is_credit_transaction(
+        bank_row
+    ):
         return False
 
     settlement_amount = get_settlement_amount(
@@ -215,7 +463,26 @@ def is_possible_candidate(settlement, bank_row):
     if bank_amount is None:
         return False
 
-    if get_bank_date(bank_row) is None:
+    if get_settlement_date(
+        settlement
+    ) is None:
+        return False
+
+    if get_bank_date(
+        bank_row
+    ) is None:
+        return False
+
+    if not amount_within_candidate_window(
+        settlement_amount,
+        bank_amount
+    ):
+        return False
+
+    if not date_within_candidate_window(
+        settlement,
+        bank_row
+    ):
         return False
 
     return True
@@ -225,15 +492,17 @@ def is_possible_candidate(settlement, bank_row):
 # CANDIDATE SCORING
 # ============================================================
 
-def score_candidate(settlement, bank, bank_index):
+def score_candidate(
+    settlement,
+    bank,
+    bank_index
+):
     """
-    Calculate evidence for one candidate bank transaction.
+    Calculate evidence for ONE bank candidate.
 
-    evidence.py expects bank_rows to be a DataFrame because
-    the reconciliation model supports grouped bank credits.
-
-    Therefore even a single candidate is passed as a
-    one-row DataFrame.
+    evidence.py expects a DataFrame for grouped candidates,
+    therefore a single bank row is converted into a one-row
+    DataFrame.
     """
 
     candidate_rows = bank.loc[
@@ -249,7 +518,217 @@ def score_candidate(settlement, bank, bank_index):
 
 
 # ============================================================
-# AMBIGUITY ANALYSIS
+# SCORE EXPLANATION
+# ============================================================
+
+def build_score_explanation(
+    settlement,
+    bank_row,
+    evidence,
+    final_score
+):
+    """
+    Explain exactly why the candidate received its score.
+    """
+
+    explanations = []
+
+    settlement_amount = get_settlement_amount(
+        settlement
+    )
+
+    bank_amount = get_bank_amount(
+        bank_row
+    )
+
+    settlement_date = get_settlement_date(
+        settlement
+    )
+
+    bank_date = get_bank_date(
+        bank_row
+    )
+
+    # --------------------------------------------------------
+    # AMOUNT
+    # --------------------------------------------------------
+
+    if (
+        settlement_amount is not None
+        and bank_amount is not None
+    ):
+
+        difference = abs(
+            settlement_amount
+            - bank_amount
+        )
+
+        percentage_difference = (
+            difference
+            / settlement_amount
+        ) * 100
+
+        if difference <= 0.01:
+
+            explanations.append(
+                "Exact net settlement amount."
+            )
+
+        else:
+
+            explanations.append(
+                "Bank amount differs from the "
+                f"Razorpay settlement by "
+                f"{percentage_difference:.2f}%."
+            )
+
+    else:
+
+        explanations.append(
+            "Amount evidence unavailable."
+        )
+
+    # --------------------------------------------------------
+    # DATE
+    # --------------------------------------------------------
+
+    if (
+        settlement_date is not None
+        and bank_date is not None
+    ):
+
+        date_gap = signed_business_day_difference(
+            settlement_date,
+            bank_date
+        )
+
+        cycle = get_cycle_type(
+            settlement
+        )
+
+        if date_gap == 0:
+
+            explanations.append(
+                "Bank date exactly matches the "
+                "Razorpay settlement date."
+            )
+
+        elif date_gap > 0:
+
+            explanations.append(
+                "Bank credit occurred "
+                f"{date_gap} business day(s) "
+                "after the settlement date."
+            )
+
+        else:
+
+            explanations.append(
+                "Bank credit occurred "
+                f"{abs(date_gap)} business day(s) "
+                "before the settlement date."
+            )
+
+        if cycle:
+
+            explanations.append(
+                f"Settlement cycle: {cycle}."
+            )
+
+    else:
+
+        explanations.append(
+            "Date evidence unavailable."
+        )
+
+    # --------------------------------------------------------
+    # TRANSACTION TYPE
+    # --------------------------------------------------------
+
+    transaction_type_score = evidence.get(
+        "transaction_type_score",
+        0
+    )
+
+    if transaction_type_score >= 7:
+
+        explanations.append(
+            "Incoming bank transaction uses "
+            "a strong settlement-compatible "
+            "transfer type."
+        )
+
+    elif transaction_type_score > 0:
+
+        explanations.append(
+            "Incoming transaction type provides "
+            "partial supporting evidence."
+        )
+
+    else:
+
+        explanations.append(
+            "Transaction type provides no "
+            "supporting evidence."
+        )
+
+    # --------------------------------------------------------
+    # NARRATION
+    # --------------------------------------------------------
+
+    narration_score = evidence.get(
+        "narration_score",
+        0
+    )
+
+    if narration_score >= 3:
+
+        explanations.append(
+            "Bank narration contains a strong "
+            "Razorpay identifier."
+        )
+
+    elif narration_score > 0:
+
+        explanations.append(
+            "Bank narration provides weak "
+            "supporting evidence."
+        )
+
+    else:
+
+        explanations.append(
+            "No Razorpay identifier was found "
+            "in the bank narration."
+        )
+
+    # --------------------------------------------------------
+    # FINAL
+    # --------------------------------------------------------
+
+    if final_score >= 99.99:
+
+        explanations.append(
+            "Evidence is effectively complete."
+        )
+
+    else:
+
+        missing = round(
+            100.0 - final_score,
+            2
+        )
+
+        explanations.append(
+            f"Overall evidence is {missing:.2f} "
+            "points below 100."
+        )
+
+    return explanations
+
+
+# ============================================================
+# AMBIGUITY
 # ============================================================
 
 def calculate_ambiguity_penalty(
@@ -257,189 +736,174 @@ def calculate_ambiguity_penalty(
     competing_scores
 ):
     """
-    Apply a small ambiguity penalty.
+    Calculate ambiguity penalty.
 
-    IMPORTANT:
+    This is intentionally small.
 
-    Ambiguity should NOT heavily punish a candidate that has
-    otherwise strong evidence.
-
-    Proposed hierarchy:
-
-        No meaningful competitor
-            -> 0.00
-
-        One weak competitor
-            -> 0.25
-
-        One reasonably strong competitor
-            -> 0.50
-
-        Two strong competitors
-            -> 0.75
-
-        Multiple nearly identical candidates
-            -> 1.00 maximum
-
-    The penalty is deliberately capped at 1%.
-
-    candidate_score:
-        Evidence score of selected candidate.
-
-    competing_scores:
-        Evidence scores of alternative candidates.
+    Competition is primarily handled through the
+    final decision logic rather than destroying the
+    evidence score.
     """
 
     if not competing_scores:
         return 0.0
 
-    # Keep only candidates that are genuinely competitive.
-    meaningful_competitors = [
-        score
-        for score in competing_scores
-        if score >= candidate_score - 15
-    ]
+    second_score = max(
+        competing_scores
+    )
 
-    if not meaningful_competitors:
+    difference = (
+        candidate_score
+        - second_score
+    )
+
+    if difference >= 10:
         return 0.0
 
-    strong_competitors = [
-        score
-        for score in meaningful_competitors
-        if score >= 85
-    ]
+    if difference >= 5:
+        return 0.05
 
-    nearly_identical = [
-        score
-        for score in meaningful_competitors
-        if abs(score - candidate_score) <= 2
-    ]
+    if difference >= 3:
+        return 0.10
 
-    # Multiple nearly identical candidates.
-    if len(nearly_identical) >= 2:
-        return 1.0
-
-    # Two strong competitors.
-    if len(strong_competitors) >= 2:
-        return 0.75
-
-    # One strong competitor.
-    if len(strong_competitors) == 1:
-        return 0.50
-
-    # A weaker but still meaningful competitor.
-    return 0.25
+    return 0.15
 
 
-def determine_ambiguity_type(
-    candidate_score,
-    competing_scores
+def is_genuine_competition(
+    top_score,
+    second_score
 ):
     """
-    Explain why a candidate is considered ambiguous.
+    Determine whether the second candidate is strong enough
+    to make the result genuinely ambiguous.
+
+    A weak 40% candidate should not make a 100% candidate
+    ambiguous.
+
+    Example:
+
+        100 vs 40 -> clear winner
+
+        98 vs 97 -> genuine competition
     """
 
-    if not competing_scores:
-        return "none"
+    if second_score is None:
+        return False
 
-    meaningful = [
-        score
-        for score in competing_scores
-        if score >= candidate_score - 15
-    ]
+    if second_score < CLAIM_THRESHOLD:
+        return False
 
-    if not meaningful:
-        return "none"
+    difference = (
+        top_score
+        - second_score
+    )
 
-    if any(
-        abs(score - candidate_score) <= 2
-        for score in meaningful
-    ):
-        return "nearly_identical_candidates"
-
-    if any(
-        score >= 85
-        for score in meaningful
-    ):
-        return "strong_competitor"
-
-    return "weak_competitor"
+    return difference < AMBIGUITY_MARGIN
 
 
 # ============================================================
-# DECISION LOGIC
+# CANDIDATE GENERATION
 # ============================================================
 
-def determine_status(
-    final_score,
-    evidence,
-    ambiguity_penalty,
-    candidate_count
+def generate_candidates(
+    settlement,
+    bank,
+    claimed_bank_indices
 ):
     """
-    Determine MATCHED / REVIEW / UNMATCHED.
-
-    Amount evidence remains the dominant factor.
-
-    We avoid declaring a match merely because the final
-    mathematical score is high if the amount relationship
-    is poor.
-
-    This prevents a correct date + transaction type from
-    incorrectly overpowering a bad settlement amount.
+    Generate ALL valid, currently unclaimed candidates.
     """
 
-    amount_score = evidence.get(
-        "amount_score",
-        0
+    candidates = []
+
+    for index, bank_row in bank.iterrows():
+
+        # ----------------------------------------------------
+        # NEVER reuse a claimed bank transaction
+        # ----------------------------------------------------
+
+        if index in claimed_bank_indices:
+            continue
+
+        # ----------------------------------------------------
+        # Basic validation
+        # ----------------------------------------------------
+
+        if not valid_candidate(
+            settlement,
+            bank_row
+        ):
+            continue
+
+        # ----------------------------------------------------
+        # Score candidate
+        # ----------------------------------------------------
+
+        evidence = score_candidate(
+            settlement,
+            bank,
+            index
+        )
+
+        base_score = float(
+            evidence.get(
+                "base_score",
+                0.0
+            )
+        )
+
+        # ----------------------------------------------------
+        # Ignore extremely weak candidates.
+        # ----------------------------------------------------
+
+        if base_score < MIN_CANDIDATE_SCORE:
+            continue
+
+        candidates.append({
+
+            "bank_index": index,
+
+            "evidence": evidence,
+
+            "base_score": base_score,
+
+            "bank_amount":
+                get_bank_amount(
+                    bank_row
+                ),
+
+            "bank_date":
+                get_bank_date(
+                    bank_row
+                ),
+
+            "bank_reference":
+                bank_row.get(
+                    "bank_reference",
+                    bank_row.get(
+                        "ref_no_cheque_no",
+                        bank_row.get(
+                            "reference",
+                            index
+                        )
+                    )
+                ),
+        })
+
+    # --------------------------------------------------------
+    # Highest evidence first
+    # --------------------------------------------------------
+
+    candidates.sort(
+        key=lambda x: x["base_score"],
+        reverse=True
     )
 
-    date_score = evidence.get(
-        "date_score",
-        0
-    )
-
-    # --------------------------------------------------------
-    # Exact amount
-    # --------------------------------------------------------
-
-    if amount_score >= 74:
-
-        if final_score >= MATCH_THRESHOLD:
-
-            return "MATCHED"
-
-    # --------------------------------------------------------
-    # Strong but non-exact amount
-    # --------------------------------------------------------
-
-    if amount_score >= 55:
-
-        if final_score >= MATCH_THRESHOLD:
-
-            return "REVIEW"
-
-    # --------------------------------------------------------
-    # Weak amount relationship
-    # --------------------------------------------------------
-
-    if amount_score < 45:
-
-        return "UNMATCHED"
-
-    # --------------------------------------------------------
-    # Middle ground
-    # --------------------------------------------------------
-
-    if final_score >= REVIEW_THRESHOLD:
-
-        return "REVIEW"
-
-    return "UNMATCHED"
+    return candidates
 
 
 # ============================================================
-# SINGLE SETTLEMENT MATCH
+# MAIN MATCH FUNCTION
 # ============================================================
 
 def match_settlement(
@@ -448,349 +912,443 @@ def match_settlement(
     claimed_bank_indices
 ):
     """
-    Find the best bank statement candidate for one
-    Razorpay settlement.
+    Match ONE Razorpay settlement against the bank statement.
 
-    claimed_bank_indices prevents the same bank transaction
-    from being assigned to multiple settlements.
+    Decision logic
+    --------------
+
+    ONE candidate:
+
+        >= 95%
+            MATCHED
+
+        < 95%
+            REVIEW / UNMATCHED
+
+    MULTIPLE candidates:
+
+        Top >= 95%
+        AND top clearly beats second
+            MATCHED
+
+        Otherwise
+            REVIEW
+
+    A weak second candidate does NOT make a strong
+    candidate ambiguous.
     """
 
-    candidates = []
+    candidates = generate_candidates(
+        settlement,
+        bank,
+        claimed_bank_indices
+    )
 
-    for index, bank_row in bank.iterrows():
-
-        if index in claimed_bank_indices:
-            continue
-
-        bank_dict = bank_row.to_dict()
-
-        if not is_possible_candidate(
-            settlement,
-            bank_dict
-        ):
-            continue
-
-        evidence = score_candidate(
-            settlement,
-            bank_dict
-        )
-
-        candidates.append({
-            "bank_index": index,
-            "evidence": evidence,
-            "evidence_score": evidence["base_score"]
-        })
-
-    # --------------------------------------------------------
-    # No candidate
-    # --------------------------------------------------------
+    # ========================================================
+    # NO CANDIDATES
+    # ========================================================
 
     if not candidates:
 
         return {
+
             "bank_index": None,
+
             "evidence": None,
-            "confidence": 0.0,
-            "status": "UNMATCHED",
+
             "ambiguity_penalty": 0.0,
+
+            "confidence": 0.0,
+
+            "status": "UNMATCHED",
+
             "ambiguity_type": "none",
+
             "candidate_count": 0,
-            "competing_indices": []
+
+            "candidate_rankings": [],
+
+            "score_explanation": [
+                "No valid unclaimed bank candidate "
+                "was found."
+            ],
+        }
+
+    # ========================================================
+    # TOP CANDIDATE
+    # ========================================================
+
+    top = candidates[0]
+
+    top_score = float(
+        top["base_score"]
+    )
+
+    second = (
+        candidates[1]
+        if len(candidates) > 1
+        else None
+    )
+
+    second_score = (
+        float(
+            second["base_score"]
+        )
+        if second is not None
+        else None
+    )
+
+    # ========================================================
+    # AMBIGUITY PENALTY
+    # ========================================================
+
+    competing_scores = []
+
+    if second is not None:
+
+        competing_scores = [
+            float(
+                candidate["base_score"]
+            )
+            for candidate in candidates[1:]
+        ]
+
+    ambiguity_penalty = calculate_ambiguity_penalty(
+        top_score,
+        competing_scores
+    )
+
+    # ========================================================
+    # FINAL SCORE
+    # ========================================================
+
+    final_score = round(
+        top_score
+        * (1.0 - ambiguity_penalty),
+        2
+    )
+
+    # ========================================================
+    # RANKINGS
+    # ========================================================
+
+    candidate_rankings = []
+
+    for rank, candidate in enumerate(
+        candidates,
+        start=1
+    ):
+
+        candidate_rankings.append({
+
+            "rank": rank,
+
+            "bank_index":
+                candidate["bank_index"],
+
+            "bank_reference":
+                candidate["bank_reference"],
+
+            "bank_amount":
+                candidate["bank_amount"],
+
+            "bank_date":
+                candidate["bank_date"],
+
+            "score":
+                round(
+                    candidate["base_score"],
+                    2
+                ),
+
+            "amount_score":
+                round(
+                    candidate["evidence"].get(
+                        "amount_score",
+                        0
+                    ),
+                    2
+                ),
+
+            "date_score":
+                round(
+                    candidate["evidence"].get(
+                        "date_score",
+                        0
+                    ),
+                    2
+                ),
+
+            "transaction_type_score":
+                round(
+                    candidate["evidence"].get(
+                        "transaction_type_score",
+                        0
+                    ),
+                    2
+                ),
+
+            "narration_score":
+                round(
+                    candidate["evidence"].get(
+                        "narration_score",
+                        0
+                    ),
+                    2
+                ),
+        })
+
+    # ========================================================
+    # SCORE EXPLANATION
+    # ========================================================
+
+    explanation = build_score_explanation(
+        settlement,
+        bank.loc[
+            top["bank_index"]
+        ],
+        top["evidence"],
+        final_score
+    )
+
+    # ========================================================
+    # DECISION
+    # ========================================================
+
+    # --------------------------------------------------------
+    # CASE 1:
+    # One candidate only
+    # --------------------------------------------------------
+
+    if second is None:
+
+        if top_score >= CLAIM_THRESHOLD:
+
+            return {
+
+                "bank_index":
+                    top["bank_index"],
+
+                "evidence":
+                    top["evidence"],
+
+                "ambiguity_penalty":
+                    0.0,
+
+                "confidence":
+                    round(
+                        top_score,
+                        2
+                    ),
+
+                "status":
+                    "MATCHED",
+
+                "ambiguity_type":
+                    "none",
+
+                "candidate_count":
+                    1,
+
+                "candidate_rankings":
+                    candidate_rankings,
+
+                "score_explanation":
+                    explanation,
+            }
+
+        return {
+
+            "bank_index": None,
+
+            "evidence":
+                top["evidence"],
+
+            "ambiguity_penalty":
+                0.0,
+
+            "confidence":
+                round(
+                    top_score,
+                    2
+                ),
+
+            "status":
+                "REVIEW",
+
+            "ambiguity_type":
+                "weak_single_candidate",
+
+            "candidate_count":
+                1,
+
+            "candidate_rankings":
+                candidate_rankings,
+
+            "score_explanation":
+                explanation
+                + [
+                    f"Candidate score is below the "
+                    f"{CLAIM_THRESHOLD:.0f}% automatic "
+                    "claim threshold."
+                ],
         }
 
     # --------------------------------------------------------
-    # Sort candidates by evidence strength
+    # CASE 2:
+    # Multiple candidates, but top is below 95%
     # --------------------------------------------------------
 
-    candidates.sort(
-        key=lambda x: x["evidence_score"],
-        reverse=True
-    )
+    if top_score < CLAIM_THRESHOLD:
 
-    best = candidates[0]
+        return {
 
-    competing = candidates[1:]
+            "bank_index": None,
 
-    competing_scores = [
-        candidate["evidence_score"]
-        for candidate in competing
-    ]
+            "evidence":
+                top["evidence"],
 
-    # --------------------------------------------------------
-    # Ambiguity
-    # --------------------------------------------------------
+            "ambiguity_penalty":
+                ambiguity_penalty,
 
-    ambiguity_penalty = calculate_ambiguity_penalty(
-        best["evidence_score"],
-        competing_scores
-    )
+            "confidence":
+                round(
+                    final_score,
+                    2
+                ),
 
-    ambiguity_type = determine_ambiguity_type(
-        best["evidence_score"],
-        competing_scores
-    )
+            "status":
+                "REVIEW",
 
-    final_score = max(
-        0.0,
-        best["evidence_score"]
-        - ambiguity_penalty
-    )
+            "ambiguity_type":
+                "multiple_weak_candidates",
 
-    status = determine_status(
-        final_score,
-        best["evidence"],
-        ambiguity_penalty,
-        len(candidates)
-    )
+            "candidate_count":
+                len(candidates),
+
+            "candidate_rankings":
+                candidate_rankings,
+
+            "score_explanation":
+                explanation
+                + [
+                    f"Best candidate is only "
+                    f"{top_score:.2f}%, below the "
+                    f"{CLAIM_THRESHOLD:.0f}% claim threshold."
+                ],
+        }
 
     # --------------------------------------------------------
-    # Competing bank references
+    # CASE 3:
+    # Multiple strong candidates
     # --------------------------------------------------------
 
-    competing_indices = [
-        candidate["bank_index"]
-        for candidate in competing
-        if candidate["evidence_score"]
-        >= best["evidence_score"] - 15
-    ]
+    if is_genuine_competition(
+        top_score,
+        second_score
+    ):
+
+        return {
+
+            "bank_index": None,
+
+            "evidence":
+                top["evidence"],
+
+            "ambiguity_penalty":
+                ambiguity_penalty,
+
+            "confidence":
+                round(
+                    final_score,
+                    2
+                ),
+
+            "status":
+                "REVIEW",
+
+            "ambiguity_type":
+                "multiple_strong_candidates",
+
+            "candidate_count":
+                len(candidates),
+
+            "candidate_rankings":
+                candidate_rankings,
+
+            "score_explanation":
+                explanation
+                + [
+                    "Multiple strong candidates were found.",
+                    (
+                        f"Top candidate: "
+                        f"{top_score:.2f}%."
+                    ),
+                    (
+                        f"Second candidate: "
+                        f"{second_score:.2f}%."
+                    ),
+                    (
+                        f"Difference: "
+                        f"{top_score - second_score:.2f} "
+                        "points."
+                    ),
+                    (
+                        "No bank row was claimed because "
+                        "the candidates are too close."
+                    ),
+                ],
+        }
+
+    # --------------------------------------------------------
+    # CASE 4:
+    # Multiple candidates, but top clearly wins
+    # --------------------------------------------------------
 
     return {
-        "bank_index": best["bank_index"],
 
-        "evidence": best["evidence"],
+        "bank_index":
+            top["bank_index"],
 
-        "confidence": round(
-            final_score,
-            2
-        ),
+        "evidence":
+            top["evidence"],
 
-        "status": status,
-
-        "ambiguity_penalty": round(
+        "ambiguity_penalty":
             ambiguity_penalty,
-            2
-        ),
+
+        "confidence":
+            round(
+                final_score,
+                2
+            ),
+
+        "status":
+            "MATCHED",
 
         "ambiguity_type":
-            ambiguity_type,
+            "none",
 
         "candidate_count":
             len(candidates),
 
-        "competing_indices":
-            competing_indices
+        "candidate_rankings":
+            candidate_rankings,
+
+        "score_explanation":
+            explanation
+            + [
+                (
+                    f"Top candidate scored "
+                    f"{top_score:.2f}%."
+                ),
+                (
+                    f"Second candidate scored "
+                    f"{second_score:.2f}%."
+                ),
+                (
+                    "Top candidate exceeded the "
+                    f"{CLAIM_THRESHOLD:.0f}% claim threshold "
+                    "and was sufficiently stronger."
+                ),
+            ],
     }
-
-
-# ============================================================
-# FULL RECONCILIATION
-# ============================================================
-
-def reconcile_settlements(
-    settlements,
-    bank
-):
-    """
-    Reconcile every Razorpay settlement against the bank.
-
-    Returns:
-
-        results
-        unmatched_bank_indices
-    """
-
-    results = []
-
-    claimed_bank_indices = set()
-
-    for _, settlement_row in settlements.iterrows():
-
-        settlement = settlement_row.to_dict()
-
-        result = match_settlement(
-            settlement,
-            bank,
-            claimed_bank_indices
-        )
-
-        # ----------------------------------------------------
-        # Selected bank transaction
-        # ----------------------------------------------------
-
-        if result["bank_index"] is not None:
-
-            selected_index = result["bank_index"]
-
-            claimed_bank_indices.add(
-                selected_index
-            )
-
-            bank_row = bank.loc[
-                selected_index
-            ]
-
-            bank_reference = get_bank_reference(
-                bank_row,
-                selected_index
-            )
-
-            bank_date = get_bank_date(
-                bank_row
-            )
-
-            bank_amount = get_bank_amount(
-                bank_row
-            )
-
-        else:
-
-            bank_reference = None
-            bank_date = None
-            bank_amount = None
-
-        # ----------------------------------------------------
-        # Settlement values
-        # ----------------------------------------------------
-
-        settlement_id = settlement.get(
-            "settlement_id",
-            settlement.get(
-                "id",
-                ""
-            )
-        )
-
-        settlement_date = settlement.get(
-            "settlement_date"
-        )
-
-        net_settlement = get_settlement_amount(
-            settlement
-        )
-
-        # ----------------------------------------------------
-        # Competing references
-        # ----------------------------------------------------
-
-        competing_refs = []
-
-        for competing_index in result.get(
-            "competing_indices",
-            []
-        ):
-
-            competing_row = bank.loc[
-                competing_index
-            ]
-
-            competing_refs.append(
-                get_bank_reference(
-                    competing_row,
-                    competing_index
-                )
-            )
-
-        # ----------------------------------------------------
-        # Result row
-        # ----------------------------------------------------
-
-        evidence = result["evidence"]
-
-        results.append({
-
-            "settlement_id":
-                settlement_id,
-
-            "settlement_date":
-                settlement_date,
-
-            "razorpay_net_settlement":
-                net_settlement,
-
-            "bank_reference":
-                bank_reference,
-
-            "bank_date":
-                bank_date,
-
-            "bank_credit":
-                bank_amount,
-
-            "amount_score":
-                (
-                    evidence["amount_score"]
-                    if evidence
-                    else 0.0
-                ),
-
-            "date_score":
-                (
-                    evidence["date_score"]
-                    if evidence
-                    else 0.0
-                ),
-
-            "transaction_type_score":
-                (
-                    evidence[
-                        "transaction_type_score"
-                    ]
-                    if evidence
-                    else 0.0
-                ),
-
-            "narration_score":
-                (
-                    evidence[
-                        "narration_score"
-                    ]
-                    if evidence
-                    else 0.0
-                ),
-
-            "evidence_score":
-                (
-                    evidence["base_score"]
-                    if evidence
-                    else 0.0
-                ),
-
-            "ambiguity_penalty":
-                result["ambiguity_penalty"],
-
-            "confidence":
-                result["confidence"],
-
-            "status":
-                result["status"],
-
-            "ambiguity_type":
-                result.get(
-                    "ambiguity_type",
-                    "none"
-                ),
-
-            "candidate_count":
-                result.get(
-                    "candidate_count",
-                    0
-                ),
-
-            "competing_refs":
-                competing_refs
-        })
-
-    # --------------------------------------------------------
-    # Unmatched bank rows
-    # --------------------------------------------------------
-
-    unmatched_bank_indices = [
-        index
-        for index in bank.index
-        if index not in claimed_bank_indices
-    ]
-
-    return (
-        results,
-        unmatched_bank_indices
-    )

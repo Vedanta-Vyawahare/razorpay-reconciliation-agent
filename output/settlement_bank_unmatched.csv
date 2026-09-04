@@ -1,4 +1,3 @@
 settlement_id,settlement_date,razorpay_net_settlement,bank_reference,bank_date,bank_credit,amount_score,date_score,transaction_type_score,narration_score,base_score,ambiguity_penalty,ambiguity_type,candidate_count,top_candidate_2_score,top_candidate_3_score,confidence,status
-setl_0009,2026-06-29,133251.98,AXIS143498,2026-06-30,136799.6,15.0,13.5,7.0,3.0,38.5,0.0,none,58,27.0,25.0,38.5,UNMATCHED
-setl_0022,2026-07-15,133374.0,UTR-MISSING,2026-07-07,137186.15,15.0,0.0,7.0,3.0,25.0,0.5,reasonable,46,23.5,21.5,24.5,UNMATCHED
-setl_0030,2026-07-24,124258.61,YESB36210646,2026-07-29,27660.0,0.0,8.5,2.0,0.5,11.0,1.0,multiple,39,10.0,10.0,10.0,UNMATCHED
+setl_0022,2026-07-15,133374.0,,,,0.0,0.0,0.0,0.0,0.0,0.0,none,0,,,0.0,UNMATCHED
+setl_0030,2026-07-24,124258.61,,,,0.0,0.0,0.0,0.0,0.0,0.0,none,0,,,0.0,UNMATCHED

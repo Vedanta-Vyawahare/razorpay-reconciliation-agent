@@ -27,7 +27,7 @@ It only calculates how much evidence each candidate provides.
 
 import pandas as pd
 
-from config import WEIGHTS, RAZORPAY_KEYWORDS
+from config import WEIGHTS, RAZORPAY_KEYWORDS, EXACT_AMOUNT_TOLERANCE, SMALL_AMOUNT_TOLERANCE
 
 from datetime import timedelta
 
@@ -36,6 +36,26 @@ from datetime import timedelta
 # HELPERS
 # ============================================================
 
+def safe_date(value):
+    """
+    Safely convert a value to pandas Timestamp.
+    """
+
+    if value is None:
+        return None
+
+    try:
+
+        if pd.isna(value):
+            return None
+
+        return pd.to_datetime(value)
+
+    except Exception:
+
+        return None
+    
+    
 def pd_is_missing(value):
     """
     Safely determine whether a value is missing.
@@ -102,6 +122,38 @@ def business_day_difference(date1, date2):
 
     return business_days * direction
 
+def get_settlement_amount(settlement):
+    """
+    Retrieve Razorpay net settlement amount.
+
+    Supports:
+        net_settlement
+
+    and the older internal field:
+        net_amount
+    """
+
+    value = settlement.get(
+        "net_settlement",
+        settlement.get(
+            "net_amount"
+        )
+    )
+
+    try:
+
+        if value is None or pd.isna(value):
+            return None
+
+        return float(value)
+
+    except (
+        TypeError,
+        ValueError
+    ):
+
+        return None
+
 
 # ============================================================
 # AMOUNT EVIDENCE
@@ -112,16 +164,12 @@ def amount_score(
     bank_amount
 ):
     """
-    Calculate amount evidence.
+    Amount evidence.
 
     Maximum:
         WEIGHTS["amount"]
 
-    The Razorpay `net_settlement` is compared directly
-    against the bank credit amount.
-
-    Exact equality receives the full amount weight.
-    Small differences receive progressively less evidence.
+    Exact net settlement amount receives full evidence.
     """
 
     max_score = WEIGHTS["amount"]
@@ -133,6 +181,7 @@ def amount_score(
         return 0.0
 
     try:
+
         settlement_amount = float(
             settlement_amount
         )
@@ -141,235 +190,111 @@ def amount_score(
             bank_amount
         )
 
-    except (TypeError, ValueError):
+    except (
+        TypeError,
+        ValueError
+    ):
 
         return 0.0
 
     if settlement_amount <= 0:
-
         return 0.0
 
     difference = abs(
-        settlement_amount - bank_amount
+        settlement_amount
+        - bank_amount
     )
 
-    # --------------------------------------------------------
-    # EXACT MATCH
-    # --------------------------------------------------------
-
-    if difference <= 0.01:
-
+    if difference <= EXACT_AMOUNT_TOLERANCE:
         return max_score
 
+    # Percentage difference relative to settlement amount
     percentage_difference = (
         difference
         / settlement_amount
     ) * 100
 
-    # --------------------------------------------------------
-    # AMOUNT EVIDENCE CURVE
-    # --------------------------------------------------------
-    #
-    # The closer the bank credit is to the Razorpay
-    # net settlement, the stronger the evidence.
-    #
-    # 0.00%  -> 100% of amount weight
-    # 0.10%  -> 98%
-    # 0.25%  -> 94%
-    # 0.50%  -> 87%
-    # 1.00%  -> 73%
-    # 2.00%  -> 53%
-    # 5.00%  -> 20%
-    # >10%   -> 0
-    #
-    # --------------------------------------------------------
+    # Small absolute differences (e.g. rounding) should still
+    # contribute meaningful evidence. Use configured small
+    # tolerance as a guideline.
+    try:
+        small_abs_threshold = float(SMALL_AMOUNT_TOLERANCE)
+    except Exception:
+        small_abs_threshold = 1.0
 
-    if percentage_difference <= 0.10:
+    # Score curve (heuristic): gradually degrade evidence as
+    # percentage difference increases.
+    if difference <= small_abs_threshold:
+        return max_score * 0.9
 
-        return max_score * 0.98
+    if percentage_difference <= 1.0:
+        return max_score * 0.8
 
-    if percentage_difference <= 0.25:
+    if percentage_difference <= 3.0:
+        return max_score * 0.5
 
-        return max_score * 0.94
-
-    if percentage_difference <= 0.50:
-
-        return max_score * 0.87
-
-    if percentage_difference <= 1.00:
-
-        return max_score * 0.73
-
-    if percentage_difference <= 2.00:
-
-        return max_score * 0.53
-
-    if percentage_difference <= 5.00:
-
-        return max_score * 0.20
-
-    if percentage_difference <= 10.00:
-
-        return max_score * 0.05
+    if percentage_difference <= 7.0:
+        return max_score * 0.25
 
     return 0.0
 
 
-# ============================================================
-# SETTLEMENT TIMING EVIDENCE
-# ============================================================
-
-def expected_cycle(settlement):
+def date_score(settlement, bank_date):
     """
-    Determine the expected settlement cycle.
-
-    Examples:
-
-        standard_t+2
-        merchant_t+1
-        instant_t+0
-
-    The settlement dataset is the source of truth for the
-    expected cycle.
-    """
-
-    cycle = str(
-        settlement.get(
-            "settlement_cycle",
-            ""
-        )
-    ).lower()
-
-    if "t+0" in cycle:
-        return 0
-
-    if "t+1" in cycle:
-        return 1
-
-    if "t+2" in cycle:
-        return 2
-
-    return None
-
-
-def date_score(
-    settlement,
-    bank_date
-):
-    """
-    Settlement timing evidence.
+    Date evidence.
 
     Maximum:
         WEIGHTS["date"]
 
-    The score is based on the EXPECTED settlement cycle.
-
-    Example:
-
-        merchant_t+1
-
-        actual T+1
-            -> maximum timing evidence
-
-        actual T+2
-            -> still plausible, but weaker
-
-        actual T+3
-            -> weaker again
-
-        actual T-1
-            -> very weak
-
-    This function deliberately does not hardcode bank holidays.
+    Compares Razorpay settlement_date with the
+    actual bank credit date using business days.
     """
-
-    max_score = WEIGHTS["date"]
 
     settlement_date = settlement.get(
         "settlement_date"
     )
 
-    if (
-        pd_is_missing(settlement_date)
-        or pd_is_missing(bank_date)
-    ):
-        return 0.0
-
-    expected_days = expected_cycle(
-        settlement
+    settlement_date = safe_date(
+        settlement_date
     )
 
-    if expected_days is None:
-        return max_score * 0.40
-
-    actual_days = business_day_difference(
-        settlement_date,
+    bank_date = safe_date(
         bank_date
     )
 
-    if actual_days is None:
+    if (
+        settlement_date is None
+        or bank_date is None
+    ):
         return 0.0
 
-    deviation = (
-        actual_days
-        - expected_days
+    difference = abs(
+        business_day_difference(
+            settlement_date,
+            bank_date
+        )
     )
 
-    # --------------------------------------------------------
-    # Exact expected settlement day
-    # --------------------------------------------------------
+    max_score = WEIGHTS["date"]
 
-    if deviation == 0:
+    if difference == 0:
         return max_score
 
-    # --------------------------------------------------------
-    # One business day late
-    # Still plausible.
-    # --------------------------------------------------------
-
-    if deviation == 1:
+    if difference == 1:
         return max_score * 0.90
 
-    # --------------------------------------------------------
-    # Two business days late
-    # Possible, but weaker.
-    # --------------------------------------------------------
+    if difference == 2:
+        return max_score * 0.75
 
-    if deviation == 2:
-        return max_score * 0.70
-
-    # --------------------------------------------------------
-    # Three business days late
-    # --------------------------------------------------------
-
-    if deviation == 3:
-        return max_score * 0.45
-
-    # --------------------------------------------------------
-    # Four business days late
-    # --------------------------------------------------------
-
-    if deviation == 4:
-        return max_score * 0.25
-
-    # --------------------------------------------------------
-    # Early settlement.
-    #
-    # T+1 expected but T+0 observed:
-    # possible in some cases, but should not receive full
-    # timing evidence.
-    # --------------------------------------------------------
-
-    if deviation == -1:
-
+    if difference == 3:
         return max_score * 0.55
 
-    # More than one business day early is suspicious.
-    if deviation < -1:
+    if difference == 4:
+        return max_score * 0.35
 
+    if difference == 5:
         return max_score * 0.15
 
-    # Far outside expected window.
     return 0.0
 
 
@@ -578,7 +503,7 @@ def calculate_evidence(settlement, bank_rows):
         bank_date = None
 
     date = date_score(
-        settlement["settlement_date"],
+        settlement,
         bank_date
     )
 
@@ -653,7 +578,7 @@ def group_transaction_type_score(bank_rows):
     )
 
     if types & {"NEFT", "IMPS", "RTGS"}:
-        return 7.0
+        return WEIGHTS.get("transaction_type", 7.0)
 
     if "TRANSFER" in types:
         return 5.0
@@ -671,6 +596,41 @@ def group_narration_score(bank_rows):
 
     for keyword in RAZORPAY_KEYWORDS:
         if keyword in text:
-            return 3.0
+            return WEIGHTS.get("narration", 3.0)
 
-    return 0.5
+    # Small supporting score when any narration text exists.
+    return max(0.0, WEIGHTS.get("narration", 3.0) * 0.15)
+
+
+def expected_cycle(settlement):
+    """
+    Convert settlement cycle string into expected business days.
+    Mirrors the behaviour used elsewhere (e.g. matching.expected_cycle_days).
+    Returns an integer number of days or None.
+    """
+
+    if settlement is None:
+        return None
+
+    value = settlement.get(
+        "settlement_cycle"
+    )
+
+    if value is None:
+        return None
+
+    cycle = str(value).strip().lower()
+
+    if "t+0" in cycle:
+        return 0
+
+    if "t+1" in cycle:
+        return 1
+
+    if "t+2" in cycle:
+        return 2
+
+    if "t+3" in cycle:
+        return 3
+
+    return None
