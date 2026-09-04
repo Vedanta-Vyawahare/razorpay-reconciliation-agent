@@ -136,8 +136,14 @@ def amount_score(
 
     try:
         settlement_amount = float(
-            settlement_amount
+            settlement.get(
+                "net_settlement",
+                settlement.get(
+                    "net_amount"
         )
+    )
+)
+        
 
         bank_amount = float(
             bank_amount
@@ -542,48 +548,105 @@ def narration_score(narration):
 # COMPLETE EVIDENCE
 # ============================================================
 
-def calculate_evidence(
-    settlement,
-    bank_row
-):
-    """
-    Calculate all deterministic evidence for one:
+def calculate_evidence(settlement, bank_rows):
 
-        Razorpay settlement -> bank transaction
+    settlement_amount = get_settlement_amount(
+        settlement
+    )
 
-    candidate.
+    if settlement_amount is None:
+        return {
+            "amount_score": 0.0,
+            "date_score": 0.0,
+            "transaction_type_score": 0.0,
+            "narration_score": 0.0,
+            "base_score": 0.0,
+        }
 
-    Returns individual evidence components plus the
-    total deterministic evidence score.
-    """
+    # --------------------------------------------------------
+    # NORMALISE BANK INPUT
+    # --------------------------------------------------------
+    #
+    # Grouped reconciliation should pass a DataFrame.
+    # But if a single bank row is passed, convert it
+    # into a one-row DataFrame.
+    #
+
+    if isinstance(bank_rows, pd.Series):
+
+        bank_rows = bank_rows.to_frame().T
+
+    elif not isinstance(bank_rows, pd.DataFrame):
+
+        bank_rows = pd.DataFrame(
+            [bank_rows]
+        )
+
+    # --------------------------------------------------------
+    # BANK AMOUNT
+    # --------------------------------------------------------
+
+    bank_amount = round(
+        pd.to_numeric(
+            bank_rows["bank_amount"],
+            errors="coerce"
+        ).fillna(0).sum(),
+        2
+    )
+
+    # --------------------------------------------------------
+    # AMOUNT EVIDENCE
+    # --------------------------------------------------------
 
     amount = amount_score(
-        settlement.get(
-            "net_amount"
-        ),
-        bank_row.get(
-            "bank_amount"
-        )
+        settlement_amount,
+        bank_amount
     )
+
+    # --------------------------------------------------------
+    # BANK DATE
+    # --------------------------------------------------------
+
+    bank_dates = bank_rows[
+        "bank_date"
+    ].dropna()
+
+    if len(bank_dates) > 0:
+
+        bank_date = bank_dates.iloc[0]
+
+    else:
+
+        bank_date = None
 
     date = date_score(
-        settlement,
-        bank_row.get(
-            "bank_date"
-        )
+        settlement["settlement_date"],
+        bank_date
     )
+
+    # --------------------------------------------------------
+    # TRANSACTION TYPE
+    # --------------------------------------------------------
 
     transaction_type = (
-        transaction_type_score(
-            bank_row
+        group_transaction_type_score(
+            bank_rows
         )
     )
 
-    narration = narration_score(
-        bank_row.get(
-            "narration"
+    # --------------------------------------------------------
+    # NARRATION
+    # --------------------------------------------------------
+
+    narration = (
+        group_narration_score(
+            bank_rows
         )
     )
+
+    # --------------------------------------------------------
+    # TOTAL EVIDENCE
+    # --------------------------------------------------------
 
     base_score = (
         amount
@@ -595,32 +658,54 @@ def calculate_evidence(
     return {
 
         "amount_score":
-            round(
-                amount,
-                2
-            ),
+            round(amount, 2),
 
         "date_score":
-            round(
-                date,
-                2
-            ),
+            round(date, 2),
 
         "transaction_type_score":
-            round(
-                transaction_type,
-                2
-            ),
+            round(transaction_type, 2),
 
         "narration_score":
-            round(
-                narration,
-                2
-            ),
+            round(narration, 2),
 
         "base_score":
-            round(
-                base_score,
-                2
-            )
+            round(base_score, 2),
     }
+
+def group_transaction_type_score(bank_rows):
+
+    if len(bank_rows) == 0:
+        return 0.0
+
+    if not bank_rows["is_credit"].all():
+        return 0.0
+
+    types = set(
+        bank_rows["transaction_type"]
+        .astype(str)
+        .str.upper()
+    )
+
+    if types & {"NEFT", "IMPS", "RTGS"}:
+        return 7.0
+
+    if "TRANSFER" in types:
+        return 5.0
+
+    return 2.0
+
+def group_narration_score(bank_rows):
+
+    text = " ".join(
+        bank_rows["narration"]
+        .fillna("")
+        .astype(str)
+        .str.upper()
+    )
+
+    for keyword in RAZORPAY_KEYWORDS:
+        if keyword in text:
+            return 3.0
+
+    return 0.5

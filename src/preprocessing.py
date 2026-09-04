@@ -228,3 +228,66 @@ def prepare_bank_statement(df):
     )
 
     return df
+
+def preprocess_bank(bank):
+    bank = bank.copy()
+
+    bank["bank_date"] = pd.to_datetime(
+        bank["post_date"],
+        errors="coerce"
+    )
+
+    bank["value_date"] = pd.to_datetime(
+        bank["value_date"],
+        errors="coerce"
+    )
+
+    bank["bank_amount"] = pd.to_numeric(
+        bank["credit"],
+        errors="coerce"
+    ).fillna(0.0)
+
+    bank["bank_reference"] = (
+        bank["ref_no_cheque_no"]
+        .astype(str)
+        .str.strip()
+    )
+
+    bank["narration"] = (
+        bank["details"]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+    )
+
+    bank["is_credit"] = bank["credit"].fillna(0) > 0
+
+    bank["transaction_type"] = (
+        bank["details"]
+        .fillna("")
+        .astype(str)
+        .str.upper()
+        .apply(extract_transaction_type)
+    )
+
+    return bank
+
+def extract_transaction_type(details):
+    text = str(details).upper()
+
+    if "/NEFT/" in text:
+        return "NEFT"
+
+    if "/IMPS/" in text:
+        return "IMPS"
+
+    if "/RTGS/" in text:
+        return "RTGS"
+
+    if "/UPI/" in text:
+        return "UPI"
+
+    if "TRANSFER" in text:
+        return "TRANSFER"
+
+    return "UNKNOWN"
