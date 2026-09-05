@@ -1,0 +1,1 @@
+ledger_id,invoice_id,ledger_date,ledger_amount,customer_name,payment_mode,bank_reference,bank_date,bank_amount,amount_score,date_score,reference_score,reference_applicable,party_score,transaction_type_score,narration_score,base_score,ambiguity_penalty,confidence,status,score_explanation,reason

@@ -1,3 +1,2 @@
-settlement_id,settlement_date,razorpay_net_settlement,bank_reference,bank_date,bank_credit,amount_score,date_score,transaction_type_score,narration_score,base_score,ambiguity_penalty,ambiguity_type,candidate_count,top_candidate_2_score,top_candidate_3_score,confidence,status
-setl_0022,2026-07-15,133374.0,,,,0.0,0.0,0.0,0.0,0.0,0.0,none,0,,,0.0,UNMATCHED
-setl_0030,2026-07-24,124258.61,,,,0.0,0.0,0.0,0.0,0.0,0.0,none,0,,,0.0,UNMATCHED
+settlement_id,settlement_date,settlement_cycle,settlement_utr,razorpay_net_settlement,bank_reference,bank_date,bank_credit,amount_score,date_score,transaction_type_score,narration_score,reference_score,base_score,ambiguity_penalty,ambiguity_type,candidate_count,top_candidate_2_score,top_candidate_3_score,confidence,status,score_explanation,reason
+setl_0030,2026-07-24,standard_t+2,RZP20260630HDFC4457,124258.61,,,,0.0,0.0,0.0,0.0,0.0,0.0,0.0,none,0,,,0.0,UNMATCHED,Settlement status is failed. It should not appear in the bank statement.,NO VALID CANDIDATES

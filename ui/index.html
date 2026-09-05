@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Razorpay & Ledger Reconciliation Agent</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div class="glass-background"></div>
+    
+    <div class="app-container">
+        <header class="top-nav glass-panel">
+            <div class="logo-area">
+                <div class="logo-icon"></div>
+                <h1>Reconciliation Agent</h1>
+            </div>
+            <div class="nav-controls">
+                <div class="mode-toggles">
+                    <button class="nav-btn active" id="btn-path-rzp">Razorpay Path</button>
+                    <button class="nav-btn" id="btn-path-ledger">Ledger Path</button>
+                    <button class="nav-btn" id="btn-path-unknown">Unknown Bank Rows</button>
+                </div>
+                <div class="view-toggles" style="margin-left: 2rem; border-left: 1px solid rgba(255,255,255,0.1); padding-left: 2rem;">
+                    <button class="nav-btn active" id="btn-dashboard">Dashboard</button>
+                    <button class="nav-btn" id="btn-review">Review Queue</button>
+                </div>
+            </div>
+        </header>
+
+        <main id="view-dashboard" class="view-section active">
+            <section class="stats-grid" id="stats-container">
+                <div class="stat-card glass-panel">
+                    <h3 id="stat-total-title">Total Rows</h3>
+                    <p class="stat-value" id="stat-total">--</p>
+                </div>
+                <div class="stat-card glass-panel success">
+                    <h3>Matched</h3>
+                    <p class="stat-value" id="stat-matched">--</p>
+                </div>
+                <div class="stat-card glass-panel warning">
+                    <h3>Review Required</h3>
+                    <p class="stat-value" id="stat-review">--</p>
+                </div>
+                <div class="stat-card glass-panel danger">
+                    <h3>Unmatched</h3>
+                    <p class="stat-value" id="stat-unmatched">--</p>
+                </div>
+            </section>
+            
+            <section class="table-section glass-panel">
+                <div class="table-header">
+                    <h2 id="table-title">Razorpay Reconciliation</h2>
+                    <select id="status-filter" class="styled-select">
+                        <option value="">All Statuses</option>
+                        <option value="MATCHED">Matched</option>
+                        <option value="REVIEW">Review</option>
+                        <option value="UNMATCHED">Unmatched</option>
+                    </select>
+                </div>
+                <div class="table-container">
+                    <table id="reconciliation-table">
+                        <thead>
+                            <tr id="table-head-row">
+                                <!-- Dynamic headers -->
+                            </tr>
+                        </thead>
+                        <tbody id="table-body">
+                            <!-- Rows injected by JS -->
+                        </tbody>
+                    </table>
+                </div>
+            </section>
+        </main>
+
+        <main id="view-review" class="view-section">
+            <section class="review-queue-header glass-panel">
+                <h2>Human Intervention Required</h2>
+                <p>The following rows require manual override due to high ambiguity, competing candidates, or data mismatches.</p>
+            </section>
+            <div id="review-list" class="review-grid">
+                <!-- Review cards injected by JS -->
+            </div>
+        </main>
+
+    </div>
+
+    <!-- Modal for Detailed View -->
+    <div id="detail-modal" class="modal">
+        <div class="modal-content glass-panel">
+            <span class="close-btn">&times;</span>
+            <h2 id="modal-title">Details</h2>
+            <div class="modal-body" id="modal-body">
+                <!-- Details injected here -->
+            </div>
+        </div>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>
